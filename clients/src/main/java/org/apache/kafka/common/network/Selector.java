@@ -102,21 +102,32 @@ public class Selector implements Selectable, AutoCloseable {
     }
 
     private final Logger log;
+    //这个对象就是javaNIO里面的Selector，Selector是负责网络的建立，发送网络请求，处理实际的网络IO，所以他是最最核心的这么样的一个组件。
     private final java.nio.channels.Selector nioSelector;
+    /**
+     * broker 和 KafkaChannel的映射，这儿的kafkaChannel大家暂时可以理解为就是SocketChannel，代表的就是一个网络连接。
+     * channels broker id对应一个网络连接，一个网络连接对应一个KafkaChannel，底层对应的是SocketChannel，SocketChannel对应的是最最底层的网络通信层面的一个Socket，套接字通信，Socket通信，TCP
+     */
     private final Map<String, KafkaChannel> channels;
     private final Set<KafkaChannel> explicitlyMutedChannels;
     private boolean outOfMemory;
+    //已经完成发送的请求，并且未处理响应
     private final List<NetworkSend> completedSends;
+    //已经接收到的，并且未处理响应
     private final LinkedHashMap<String, NetworkReceive> completedReceives;
     private final Set<SelectionKey> immediatelyConnectedKeys;
     private final Map<String, KafkaChannel> closingChannels;
     private Set<SelectionKey> keysWithBufferedRead;
+    // 没有建立连接的broker
     private final Map<String, ChannelState> disconnected;
+    // 建立连接的broker
     private final List<String> connected;
+    // 发送请求失败的broker
     private final List<String> failedSends;
     private final Time time;
     private final SelectorMetrics sensors;
     private final ChannelBuilder channelBuilder;
+    //最大可以接收的数据量的大小
     private final int maxReceiveSize;
     private final boolean recordTimePerConnection;
     private final IdleExpiryManager idleExpiryManager;
@@ -247,18 +258,36 @@ public class Selector implements Selectable, AutoCloseable {
      */
     @Override
     public void connect(String id, InetSocketAddress address, int sendBufferSize, int receiveBufferSize) throws IOException {
+        // 1.先确认是否已经被连接过
         ensureNotRegistered(id);
+        // 2.打开一个 SocketChannel
         SocketChannel socketChannel = SocketChannel.open();
         SelectionKey key = null;
         try {
+            // 3.设置 socketChannel 信息
             configureSocketChannel(socketChannel, sendBufferSize, receiveBufferSize);
+            // 4.尝试发起连接
             boolean connected = doConnect(socketChannel, address);
+            // 5. 将该 socketChannel 注册到 nioSelector 上，并关注 OP_CONNECT 事件
             key = registerChannel(id, socketChannel, SelectionKey.OP_CONNECT);
 
-            if (connected) {
+            /**
+             * 所以正常情况下，这儿网络不能完成连接。
+             * 如果这儿不能完成连接。大家猜一下：kafka会在哪儿完成网络最后的连接呢？
+             *
+             * 如果这里没有处理连接，则会在Selector#pollSelectionKeys方法中处理：
+             *                 if (isImmediatelyConnected || key.isConnectable()) {
+             *                     if (channel.finishConnect()) {
+             *                         this.connected.add(nodeId);
+             *                         this.sensors.connectionCreated.record();
+             *                         ......
+             */
+            if (connected) {// 6.如果立即连接成功了
                 // OP_CONNECT won't trigger for immediately connected channels
                 log.debug("Immediately connected to node {}", id);
+                // 先将 key 放入 immediatelyConnectedKeys 集合
                 immediatelyConnectedKeys.add(key);
+                // 取消前面注册 OP_CONNECT 事件。
                 key.interestOps(0);
             }
         } catch (IOException | RuntimeException e) {
@@ -274,6 +303,13 @@ public class Selector implements Selectable, AutoCloseable {
     // in order to simulate "immediately connected" sockets.
     protected boolean doConnect(SocketChannel channel, InetSocketAddress address) throws IOException {
         try {
+            /**
+             * 一个channel在非阻塞模式下执行connect后，如果连接能马上建立好则返回true，否则完成false。如果返回false，那么只能通过之后调用finishConnect来判断连接是否完成。
+             *
+             * 如果这个SocketChannel是被设置为非阻塞模式的话，那么对这个connect方法的调用，会初始化一个非阻塞的连接请求，
+             * 如果这个发起的连接立马就成功了，比如说客户端跟要连接的服务端都在一台机器上，此时就会出现一个立马就连接成功的情况，然后就会返回一个true；
+             * 否则只要不是那种立马可以连接成功的情况，就会返回一个false，接着就需要在后面去调用SocketChannel的finishConnect方法，去完成最终的连接
+             */
             return channel.connect(address);
         } catch (UnresolvedAddressException e) {
             throw new IOException("Can't resolve address: " + address, e);
@@ -284,11 +320,24 @@ public class Selector implements Selectable, AutoCloseable {
             throws IOException {
         socketChannel.configureBlocking(false);
         Socket socket = socketChannel.socket();
+        /**
+         * keepalive的意思，主要是避免客户端和服务端任何一方如果断开连接之后，别人不知道，一直保持着网络连接的资源；所以设置这个之后，2小时内如果双方没有任何通信，那么发送一个探测包，根据探测包的结果保持连接、重新连接或者断开连接
+         */
         socket.setKeepAlive(true);
+        /**
+         * 设置socket的发送和接收的缓冲区的大小，分别是128kb和32kb，这个缓冲区的大小一般都是在NIO编程里需要自己去设置的
+         *  可以通过如下参数设置：ProducerConfig.SEND_BUFFER_CONFIG、ProducerConfig.RECEIVE_BUFFER_CONFIG
+         *  值=-1表示采用系统默认值，可以查看 /proc/sys/net/core/rmem_max和wmen_max，默认都是122k
+         */
         if (sendBufferSize != Selectable.USE_DEFAULT_BUFFER_SIZE)
             socket.setSendBufferSize(sendBufferSize);
         if (receiveBufferSize != Selectable.USE_DEFAULT_BUFFER_SIZE)
             socket.setReceiveBufferSize(receiveBufferSize);
+        /**
+         * 默认值是false
+         * TcpNoDelay，如果默认是设置为false的话，那么就开启Nagle算法，就是把网络通信中的一些小的数据包给收集起来，组装成一个大的数据包然后再一次性的发送出去，
+         * 如果大量的小包在传递，会导致网络拥塞；如果设置为true的话，意思就是关闭Nagle，让你发送出去的数据包立马就是通过网络传输过去，所以这个参数大家也要注意下
+         */
         socket.setTcpNoDelay(true);
     }
 
@@ -327,16 +376,21 @@ public class Selector implements Selectable, AutoCloseable {
     protected SelectionKey registerChannel(String id, SocketChannel socketChannel, int interestedOps) throws IOException {
         SelectionKey key = socketChannel.register(nioSelector, interestedOps);
         KafkaChannel channel = buildAndAttachKafkaChannel(socketChannel, id, key);
+        //缓存起来
         this.channels.put(id, channel);
         if (idleExpiryManager != null)
             idleExpiryManager.update(channel.id(), time.nanoseconds());
         return key;
     }
 
-    private KafkaChannel buildAndAttachKafkaChannel(SocketChannel socketChannel, String id, SelectionKey key) throws IOException {
+    private KafkaChannel buildAndAttachKafkaChannel(SocketChannel socketChanne, String id, SelectionKey key) throws IOException {
         try {
             KafkaChannel channel = channelBuilder.buildChannel(id, key, maxReceiveSize, memoryPool,
                 new SelectorChannelMetadataRegistry());
+            //把key和KafkaChannel关联起来
+            //后面使用起来会比较方便
+            //我们可以根据key就找到KafkaChannel
+            //也可以根据KafkaChannel找到key
             key.attach(channel);
             return channel;
         } catch (Exception e) {
@@ -380,20 +434,34 @@ public class Selector implements Selectable, AutoCloseable {
     }
 
     /**
+     * 主要实现了 Kafka 客户端的网络请求的排队功能，能够将网络请求加入到发送队列中，等待后续的 poll 方法进行发送
      * Queue the given request for sending in the subsequent {@link #poll(long)} calls
      * @param send The request to send
      */
     public void send(NetworkSend send) {
+        // 获取目标连接的连接 ID
         String connectionId = send.destinationId();
+        //获得 KafkaChannel 对象，
         KafkaChannel channel = openOrClosingChannelOrFail(connectionId);
+        //若连接正在关闭，则将连接 ID 添加到 failedSends 队列中
         if (closingChannels.containsKey(connectionId)) {
             // ensure notification via `disconnected`, leave channel in the state in which closing was triggered
             this.failedSends.add(connectionId);
         } else {
             try {
+                /**
+                 * 将send对象缓存到KafkaChannel的send字段中，同时添加OP_WRITE事件的关注
+                 * send对象实际类型是NetworkSend对象，其中封装了具体的请求数据，包括请求头和请求体
+                 *
+                 * 这里只是将NetworkSend对象用KafkaChannel的send字段缓存下来，暂存数据预发送，并没有真正的发送，具体的发送会在Selector.poll()方法中进行
+                 * KafkaChannel每次只会发送一个NetworkSend对象
+                 *
+                 * NetworkSend:要交给这个底层的Channel发送出去的请求，对应的响应是：NetworkReceive
+                 */
                 channel.setSend(send);
             } catch (Exception e) {
                 // update the state for consistency, the channel will be discarded after `close`
+                // 如果 KafkaChannel 对象在处理过程中抛出异常，将连接状态设置为 FAILED_SEND，并将连接 ID 添加到 failedSends 队列中，然后关闭连接，并将异常向上抛出，以便上层代码处理
                 channel.state(ChannelState.FAILED_SEND);
                 // ensure notification via `disconnected` when `failedSends` are processed in the next poll
                 this.failedSends.add(connectionId);
@@ -438,10 +506,13 @@ public class Selector implements Selectable, AutoCloseable {
      */
     @Override
     public void poll(long timeout) throws IOException {
+        // 超时时间是否小于 0
         if (timeout < 0)
             throw new IllegalArgumentException("timeout should be >= 0");
 
         boolean madeReadProgressLastCall = madeReadProgressLastPoll;
+
+        //clear() 方法是在每次 poll() 执行的第一步，它作用的就是清理上一次 poll 过程产生的部分缓存。
         clear();
 
         boolean dataInBuffers = !keysWithBufferedRead.isEmpty();
@@ -449,6 +520,7 @@ public class Selector implements Selectable, AutoCloseable {
         if (!immediatelyConnectedKeys.isEmpty() || (madeReadProgressLastCall && dataInBuffers))
             timeout = 0;
 
+        //检查内存是否已经不足
         if (!memoryPool.isOutOfMemory() && outOfMemory) {
             //we have recovered from memory pressure. unmute any channel not explicitly muted for other reasons
             log.trace("Broker no longer low on memory - unmuting incoming sockets");
@@ -461,7 +533,9 @@ public class Selector implements Selectable, AutoCloseable {
         }
 
         /* check ready keys */
+        /* 检测已经准备好的keys */
         long startSelect = time.nanoseconds();
+        //Java NIO 库提供的 select 方法
         int numReadyKeys = select(timeout);
         long endSelect = time.nanoseconds();
         this.sensors.selectTime.record(endSelect - startSelect, time.milliseconds(), false);
@@ -470,6 +544,7 @@ public class Selector implements Selectable, AutoCloseable {
             Set<SelectionKey> readyKeys = this.nioSelector.selectedKeys();
 
             // Poll from channels that have buffered data (but nothing more from the underlying socket)
+            // 从缓冲了数据的通道进行轮询(但不再从底层套接字进行轮询)
             if (dataInBuffers) {
                 keysWithBufferedRead.removeAll(readyKeys); //so no channel gets polled twice
                 Set<SelectionKey> toPoll = keysWithBufferedRead;
@@ -478,8 +553,10 @@ public class Selector implements Selectable, AutoCloseable {
             }
 
             // Poll from channels where the underlying socket has more data
+            // 从底层套接字拥有更多数据的通道进行轮询
             pollSelectionKeys(readyKeys, false, endSelect);
             // Clear all selected keys so that they are excluded from the ready count for the next select
+            // 清除所有选定的键，使它们从下一次选择的就绪计数中排除
             readyKeys.clear();
 
             pollSelectionKeys(immediatelyConnectedKeys, true, endSelect);
@@ -492,10 +569,12 @@ public class Selector implements Selectable, AutoCloseable {
         this.sensors.ioTime.record(endIo - endSelect, time.milliseconds(), false);
 
         // Close channels that were delayed and are now ready to be closed
+        // 关闭被延迟的通道，现在可以关闭了
         completeDelayedChannelClose(endIo);
 
         // we use the time at the end of select to ensure that we don't close any connections that
         // have just been processed in pollSelectionKeys
+        // 我们使用select末尾的时间来确保不会关闭pollSelectionKeys中刚刚处理的任何连接
         maybeCloseOldestConnection(endSelect);
     }
 
@@ -524,6 +603,10 @@ public class Selector implements Selectable, AutoCloseable {
                 /* complete any connections that have finished their handshake (either normally or immediately) */
                 if (isImmediatelyConnected || key.isConnectable()) {
                     if (channel.finishConnect()) {
+                        /**
+                         * 如果发现SelectionKey当前处于的状态是可以建立连接，isConnectable方法是true，接着其实就是调用到KafkaChannel最底层的SocketChannel的finishConnect方法，等待这个连接必须执行完毕
+                         * 同时接下来就不要关注OP_CONNECT事件了，对于这个Channel，接下来Selector就不要关注连接相关的事件了，也不是OP_READ读取事件，肯定selector要关注的是OP_WRITE事件，要针对这个连接写数据。
+                         */
                         this.connected.add(nodeId);
                         this.sensors.connectionCreated.record();
 
@@ -639,18 +722,37 @@ public class Selector implements Selectable, AutoCloseable {
     }
 
     // package-private for testing
+
+    /**
+     * 1、获取 channel 对应的节点id。
+     * 2、将保存在 send 上的数据真正发送出去，但是「一次不一定能发送完」，会返回已经发出的字节数。
+     * 3、判断是否发送完成
+     *      a、如果未发送完成返回 null，「等待下次 poll 继续发送」，并继续关注这个 channel 的写事件。
+     *      b、如果发送完成，则返回 send，并取消对写事件的关注。
+     * 4、发送完成，将 send 添加到 completedSends 集合中。
+     * @param channel
+     * @throws IOException
+     */
     void write(KafkaChannel channel) throws IOException {
+        // 1.获取 channel 对应的节点id
         String nodeId = channel.id();
+        // 2. 将保存在 send 上的数据真正发送出去，但是一次不一定能发送完，会返回已经发出的字节数
         long bytesSent = channel.write();
+        // 3. 判断是否发送完成，未完成返回null，等待下次poll继续发送
         NetworkSend send = channel.maybeCompleteSend();
         // We may complete the send with bytesSent < 1 if `TransportLayer.hasPendingWrites` was true and `channel.write()`
         // caused the pending writes to be written to the socket channel buffer
+        // 4. 说明已经发出或者发送完成
         if (bytesSent > 0 || send != null) {
             long currentTimeMs = time.milliseconds();
             if (bytesSent > 0)
+                // 记录发送字节 Metrics 信息
                 this.sensors.recordBytesSent(nodeId, bytesSent, currentTimeMs);
+            // 发送完成
             if (send != null) {
+                // 将 send 添加到 completedSends
                 this.completedSends.add(send);
+                //  记录发送完成 Metrics 信息
                 this.sensors.recordCompletedSend(nodeId, send.size(), currentTimeMs);
             }
         }
@@ -1046,6 +1148,7 @@ public class Selector implements Selectable, AutoCloseable {
 
     /**
      * adds a receive to completed receives
+     * 这里接收到的所有 Receive 都会被放入到 completedReceives 的集合中等待后续处理。
      */
     private void addToCompletedReceives(KafkaChannel channel, NetworkReceive networkReceive, long currentTimeMs) {
         if (hasCompletedReceive(channel))
@@ -1436,11 +1539,16 @@ public class Selector implements Selectable, AutoCloseable {
 
     // helper class for tracking least recently used connections to enable idle connection closing
     private static class IdleExpiryManager {
+        /**
+         * idleExpiryManager 包含lruConnections 因为一般来说一个客户端不能放太多的Socket连接资源，否则会导致这个客户端的复杂过重，所以他需要采用lru的方式来不断的淘汰掉最近最少使用的一些连接，很多连接最近没怎么发送消息。
+         * 比如说有一个连接，最近一次使用是在1个小时之前了，还有一个连接，最近一次使用是在1分钟之前，此时如果要淘汰掉一个连接，你会选择谁？LRU算法，明显是淘汰掉那个1小时之前才使用的连接
+         */
         private final Map<String, Long> lruConnections;
         private final long connectionsMaxIdleNanos;
         private long nextIdleCloseCheckTime;
 
         public IdleExpiryManager(Time time, long connectionsMaxIdleMs) {
+            //connectionsMaxIdleMs：每个网络连接最多可以空闲的时间的大小，就要回收掉
             this.connectionsMaxIdleNanos = connectionsMaxIdleMs * 1000 * 1000;
             // initial capacity and load factor are default, we set them explicitly because we want to set accessOrder = true
             this.lruConnections = new LinkedHashMap<>(16, .75F, true);

@@ -568,24 +568,71 @@ class LogManager(logDirs: Seq[File],
 
     /* Schedule the cleanup task to delete old logs */
     if (scheduler != null) {
+      // 定时清理过期日志segment，并维护日志大小，默认5min执行一次
+      /**
+       * 为了保证分区总大小不超过阈值(log.retention.bytes)，LogManager会定时清理旧数据。不过一般情况下是通过配置log.retention.hours来配置segment的保存时间的。删除日志时采用的是copy-on-write的方式来避免加锁。
+          清理旧日志主要有两种：
+          删除，超过时间或大小阈值的旧segment直接进行删除
+          压缩，不是删除在，是是采用合并压缩的方式进行
+       */
       info("Starting log cleanup with a period of %d ms.".format(retentionCheckMs))
       scheduler.schedule("kafka-log-retention",
                          () => cleanupLogs(),
                          InitialTaskDelayMs,
                          retentionCheckMs)
+
+      // 定时刷新还没有写到磁盘上日志
+      /**
+       * 在linux系统中，当数据写入到文件系统后，数据其实在操作系统的page cache里，只有执行了刷盘后数据才会写到磁盘里。
+         定时任务flushDirtyLogs里，会定时将页面缓存中的数据刷新到磁盘中，kafka的刷盘策略有两种：
+          1、时间策略，通过log.flush.interval.ms进行配置，默认为无限大。
+          2、大小策略，通过log.flush.interval.messages进行配置，当数据超过这个值时进行刷盘。
+
+      需要提一下的是，定时任务里只会根据时间策略进行判断是否刷盘，根据大小判断是在append追加日志时进行的判断：
+       def append(records: MemoryRecords, assignOffsets: Boolean = true): LogAppendInfo = {
+        // now append to the log
+        segment.append(firstOffset = appendInfo.firstOffset,
+          largestOffset = appendInfo.lastOffset,
+          largestTimestamp = appendInfo.maxTimestamp,
+          shallowOffsetOfMaxTimestamp = appendInfo.offsetOfMaxTimestamp,
+          records = validRecords)
+
+        // increment the log end offset
+        updateLogEndOffset(appendInfo.lastOffset + 1)
+
+        trace("Appended message set to log %s with first offset: %d, next offset: %d, and messages: %s"
+          .format(this.name, appendInfo.firstOffset, nextOffsetMetadata.messageOffset, validRecords))
+
+        if (unflushedMessages >= config.flushInterval)
+          flush()
+      }
+
+       */
       info("Starting log flusher with a default period of %d ms.".format(flushCheckMs))
       scheduler.schedule("kafka-log-flusher",
                          () => flushDirtyLogs(),
                          InitialTaskDelayMs,
                          flushCheckMs)
+
+      // 定时将所有日志的checkpoint写到checkpoint文件中，默认60s执行一次
+      /**
+       * checkpoint文件
+        在LogManager中有一个非常重要的文件---checkpoint文件：
+        1、创建LogManager时会读取checkpoint文件，并将每个分区对应的checkpoint作为日志的恢复点(recoveryPoint)，最后创建分区对应的日志实例
+        2、在将日志刷盘时，将最新的偏移量作为日志的checkpoint进行更新
+        3、LogManager启动一个定时任务，定时读取所有日志的检查点，并写入全局的检查点文件
+       */
       scheduler.schedule("kafka-recovery-point-checkpoint",
                          () => checkpointLogRecoveryOffsets(),
                          InitialTaskDelayMs,
                          flushRecoveryOffsetCheckpointMs)
+
       scheduler.schedule("kafka-log-start-offset-checkpoint",
                          () => checkpointLogStartOffsets(),
                          InitialTaskDelayMs,
                          flushStartOffsetCheckpointMs)
+
+      // 定时删除标记为delete的日志文件，默认30s执行一次
       scheduler.scheduleOnce("kafka-delete-logs", // will be rescheduled after each delete logs with a dynamic period
                          () => deleteLogs(),
                          InitialTaskDelayMs)

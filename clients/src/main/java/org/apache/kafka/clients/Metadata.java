@@ -119,6 +119,11 @@ public class Metadata implements Closeable {
      * @return remaining time in ms till the cluster info can be updated again
      */
     public synchronized long timeToAllowUpdate(long nowMs) {
+        /**
+         * 允许更新的时间点，计算方式：
+         * 上次更新时间 + 退避时间 - 当前时间的间隔
+         * 即要求上次更新时间与当前时间的间隔不能大于退避时间，如果大于则需要等待
+         */
         return Math.max(this.lastRefreshMs + this.refreshBackoffMs - nowMs, 0);
     }
 
@@ -131,6 +136,11 @@ public class Metadata implements Closeable {
      * @return remaining time in ms till updating the cluster info
      */
     public synchronized long timeToNextUpdate(long nowMs) {
+        /**
+         * 元数据是否过期，判断条件：
+         * 1. needUpdate被置为true
+         * 2. 上次更新时间距离当前时间已经超过了指定的元数据过期时间阈值metadataExpireMs（metadata.max.age.ms），默认是300秒
+         */
         long timeToExpire = updateRequested() ? 0 : Math.max(this.lastSuccessfulRefreshMs + this.metadataExpireMs - nowMs, 0);
         return Math.max(timeToExpire, timeToAllowUpdate(nowMs));
     }

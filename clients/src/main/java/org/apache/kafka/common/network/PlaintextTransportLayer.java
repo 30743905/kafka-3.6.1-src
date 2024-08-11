@@ -48,7 +48,16 @@ public class PlaintextTransportLayer implements TransportLayer {
     @Override
     public boolean finishConnect() throws IOException {
         boolean connected = socketChannel.finishConnect();
+        /**
+         * SeletionKey，里面封装了Selector对一个连接关注那个连接上的哪些事件，OP_CONNECT，OP_WRITE，OP_READ
+         *
+         * 一旦建立好连接之后，天然的就会去监听这个连接的OP_READ事件
+         * 要发送请求的时候，会把这个请求暂存到KafkaChannel里去，同时让Selector监视他的OP_WRITE事件，增加一种OP_WRITE事件，同时保留了OP_READ事件，此时Selector会同时监听这个连接的OP_WRITE和OP_READ事件
+         * 发送完了请求之后，对事件的监听会怎么样呢？一旦写完请求之后，就会把OP_WRITE事件取消监听，就是此时不关注这个写请求的事件了，此时仅仅保留关注OP_READ事件
+         */
         if (connected)
+            //取消了OP_CONNECT事件
+            //增加了OP_READ 事件 我们这儿的这个key对应的KafkaChannel是不是就可以接受服务端发送回来的响应了。
             key.interestOps(key.interestOps() & ~SelectionKey.OP_CONNECT | SelectionKey.OP_READ);
         return connected;
     }

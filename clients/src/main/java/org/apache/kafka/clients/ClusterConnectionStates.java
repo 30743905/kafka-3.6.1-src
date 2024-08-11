@@ -75,10 +75,17 @@ final class ClusterConnectionStates {
      * @return true if we can initiate a new connection
      */
     public boolean canConnect(String id, long now) {
+        //首先从缓存里面获取当前主机的连接。
         NodeConnectionState state = nodeState.get(id);
+        /**
+         * 先找到broker id对应的一个连接状态，如果此时这个连接状态是null，就说明之前从来没有建立过连接，此时就可以直接返回true，就说明可以跟这个broker建立连接；
+         * 否则如果连接状态已经存在，如果当前broker的状态是断开连接，而且上一次跟这个broker尝试建立连接的时间到现在，已经超过了重试的时间了，默认100ms
+         */
         if (state == null)
             return true;
         else
+            //可以从缓存里面获取到连接，但是连接的状态是DISCONNECTED 并且
+            // now - state.lastConnectAttemptMs >= this.reconnectBackoffMs 说明可以进行重试，重试连接。
             return state.state.isDisconnected() &&
                    now - state.lastConnectAttemptMs >= state.reconnectBackoffMs;
     }

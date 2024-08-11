@@ -268,6 +268,7 @@ class KafkaServer(
 
         logDirFailureChannel = new LogDirFailureChannel(config.logDirs.size)
 
+        // 启动logManager
         /* start log manager */
         _logManager = LogManager(
           config,
@@ -359,6 +360,7 @@ class KafkaServer(
         }
         alterPartitionManager.start()
 
+        // 启动ReplicaManager
         // Start replica manager
         _replicaManager = createReplicaManager(isShuttingDown)
         replicaManager.startup()

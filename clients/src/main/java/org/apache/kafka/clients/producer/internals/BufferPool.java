@@ -68,11 +68,17 @@ public class BufferPool {
      * @param metricGrpName logical group name for metrics
      */
     public BufferPool(long memory, int poolableSize, Metrics metrics, Time time, String metricGrpName) {
+        // poolableSize：池化缓存池一块内存块的大小「batch.size」，默认是16k
         this.poolableSize = poolableSize;
+        // lock：当有多线程并发分配和回收 ByteBuffer 时，为了保证线程的安全，使用锁来控制并发。
         this.lock = new ReentrantLock();
+        // free：池化的 free 队列，其中缓存了指定大小的 ByteBuffer 对象。
         this.free = new ArrayDeque<>();
+        // waiters：阻塞线程对应的 Condition 队列，当有申请不到足够内存的线程时，为了等待其他线程释放内存而阻塞等待，对应的 Condition 对象会进入该队列。
         this.waiters = new ArrayDeque<>();
+        // totalMemory：整个 BufferPool 内存大小「buffer.memory」，默认是32M。
         this.totalMemory = memory;
+        // 非池化可用内存
         this.nonPooledAvailableMemory = memory;
         this.metrics = metrics;
         this.time = time;
@@ -125,11 +131,15 @@ public class BufferPool {
 
         try {
             // check if we have a free buffer of the right size pooled
+            /**
+             * poolableSize就是batch.size，该大小batch可以使用pool复用
+             */
             if (size == poolableSize && !this.free.isEmpty())
                 return this.free.pollFirst();
 
             // now check if the request is immediately satisfiable with the
             // memory on hand or if we need to block
+            // freeListSize：计算出buffer.memory剩余内存大小
             int freeListSize = freeSize() * this.poolableSize;
             if (this.nonPooledAvailableMemory + freeListSize >= size) {
                 // we have enough unallocated or pooled memory to immediately
@@ -249,6 +259,8 @@ public class BufferPool {
      * buffers (if needed)
      */
     private void freeUp(int size) {
+        // 非池化内存不够时，释放空闲的池化内存补充
+        // 一个个释放直到非池化内存凑够指定size大小
         while (!this.free.isEmpty() && this.nonPooledAvailableMemory < size)
             this.nonPooledAvailableMemory += this.free.pollLast().capacity();
     }

@@ -300,15 +300,31 @@ public final class ProducerBatch {
         produceFuture.set(baseOffset, logAppendTime, recordExceptions);
 
         // execute callbacks
+        /**
+         * 我们发送数据的时候，一条消息就代表一个thunk
+         * 遍历所有我们当时发送出去的消息。
+         */
         for (int i = 0; i < thunks.size(); i++) {
             try {
                 Thunk thunk = thunks.get(i);
                 if (thunk.callback != null) {
                     if (recordExceptions == null) {
                         RecordMetadata metadata = thunk.future.value();
+                        //调用我们发送的消息的回调函数
+                        //大家还记不记得我们在发送数据的时候
+                        //还不是绑定了一个回调函数。
+                        //这儿说的调用的回调函数
+                        //就是我们开发，生产者代码的时候，我们用户传进去的那个回调函数。
                         thunk.callback.onCompletion(metadata, null);
                     } else {
                         RuntimeException exception = recordExceptions.apply(i);
+                        //如果有异常就会把异常传给回调函数。
+                        //由我们用户自己去捕获这个异常。
+                        //然后对这个异常进行处理
+                        //大家根据自己公司的业务规则进行处理就可以了。
+
+                        //如果走这个分支的话，我们的用户的代码是可以捕获到timeoutexception
+                        //这个异常，如果用户捕获到了，做对应的处理就可以了。
                         thunk.callback.onCompletion(null, exception);
                     }
                 }

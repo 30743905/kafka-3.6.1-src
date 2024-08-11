@@ -373,6 +373,10 @@ class ReplicaManager(val config: KafkaConfig,
   def startup(): Unit = {
     // start ISR expiration thread
     // A follower can lag behind leader for up to config.replicaLagTimeMaxMs x 1.5 before it is removed from ISR
+    /**
+     * ReplicaManager的初始化，它启动了两个调度任务，都是和ISR相关的，一个是清理落后太多的ISR副本，一个是将最新的ISR结果进行传播：
+     */
+    // 清理ISR中落后的Follower副本
     scheduler.schedule("isr-expiration", () => maybeShrinkIsr(), 0L, config.replicaLagTimeMaxMs / 2)
     scheduler.schedule("shutdown-idle-replica-alter-log-dirs-thread", () => shutdownIdleReplicaAlterLogDirsThread(), 0L, 10000L)
 

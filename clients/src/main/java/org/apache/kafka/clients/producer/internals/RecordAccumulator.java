@@ -270,6 +270,8 @@ public class RecordAccumulator {
      *                        running the partitioner's onNewBatch method before trying to append again
      * @param nowMs The current time, in milliseconds
      * @param cluster The cluster metadata
+     *
+     * 向 accumulator 添加一条 record，并返回添加后的结果（结果主要包含: future metadata、batch 是否满的标志以及新 batch 是否创建）其中， maxTimeToBlock 是 buffer.memory 的 block 的最大时间
      */
     public RecordAppendResult append(String topic,
                                      int partition,
@@ -279,9 +281,13 @@ public class RecordAccumulator {
                                      Header[] headers,
                                      AppendCallbacks callbacks,
                                      long maxTimeToBlock,
-                                     boolean abortOnNewBatch,
+                                     boolean abortOnNewBatch11,
                                      long nowMs,
                                      Cluster cluster) throws InterruptedException {
+        /**
+         * 步骤1 根据topic获取 TopicInfo
+         * map中不存在topic的key，则创建一个新的TopicInfo放入
+         */
         TopicInfo topicInfo = topicInfoMap.computeIfAbsent(topic, k -> new TopicInfo(logContext, k, batchSize));
 
         // We keep track of the number of appending thread to make sure we do not miss batches in
@@ -296,9 +302,20 @@ public class RecordAccumulator {
                 // availability and performance.  Note, that here we peek current partition before we hold the
                 // deque lock, so we'll need to make sure that it's not changed while we were waiting for the
                 // deque lock.
+                /**
+                 * 步骤2 获取真实的partition信息
+                 * 如果 partition == RecordMetadata.UNKNOWN_PARTITION 未分配分区器，随机选择一个分区器
+                 * 如果给定了分区器，使用给定的分区器信息
+                 步骤3
+                 *
+                 */
                 final BuiltInPartitioner.StickyPartitionInfo partitionInfo;
                 final int effectivePartition;
                 if (partition == RecordMetadata.UNKNOWN_PARTITION) {
+                    /**
+                     * 通过粘性策略进行分区分配 - 通过负载量进行分配
+                     * partition == RecordMetadata.UNKNOWN_PARTITION 的场景：未定义分区器，同时record未指定key或partitioner.ignore.keys=true
+                     */
                     partitionInfo = topicInfo.builtInPartitioner.peekCurrentPartitionInfo(cluster);
                     effectivePartition = partitionInfo.partition();
                 } else {
@@ -306,25 +323,48 @@ public class RecordAccumulator {
                     effectivePartition = partition;
                 }
 
+                // 为callback设置生效的partition
                 // Now that we know the effective partition, let the caller know.
                 setPartition(callbacks, effectivePartition);
 
+                /**
+                 * 步骤3 根据partition获得deque信息
+                 * 根据partition信息，获取TopicInfo中 Deque<ProducerBatch> dq
+                 * 如果不存在则创建新的队列
+                 */
                 // check if we have an in-progress batch
                 Deque<ProducerBatch> dq = topicInfo.batches.computeIfAbsent(effectivePartition, k -> new ArrayDeque<>());
+                /**
+                 * 加锁：锁住需要的使用到的partition，采用分段锁思想
+                 */
                 synchronized (dq) {
                     // After taking the lock, validate that the partition hasn't changed and retry.
+                    /**
+                     * 由于在锁外面就已经获取到了partition信息，需要double check分区信息是否发生变更
+                     */
                     if (partitionChanged(topic, topicInfo, partitionInfo, dq, nowMs, cluster))
                         continue;
 
+                    /**
+                     * 步骤4 将消息append到 RecordAccumulator中
+                     * 已经分配过内存buffer会在这里完成添加，如果没有分配过内存buffer下面代码不执行
+                     * 如果返回null，则证明没有空间了
+                     * 不等于null，证明有空间
+                     */
                     RecordAppendResult appendResult = tryAppend(timestamp, key, value, headers, callbacks, dq, nowMs);
                     if (appendResult != null) {
                         // If queue has incomplete batches we disable switch (see comments in updatePartitionInfo).
+                        // 校验最后一个是否满了
                         boolean enableSwitch = allBatchesFull(dq);
+                        // 判断是否需要切换分区
                         topicInfo.builtInPartitioner.updatePartitionInfo(partitionInfo, appendResult.appendedBytes, cluster, enableSwitch);
                         return appendResult;
                     }
                 }
 
+                /**
+                 * 步骤5 判断是否第一次进来分配batch，如果是第一次分配完直接返回
+                 */
                 // we don't have an in-progress record batch try to allocate a new batch
                 if (abortOnNewBatch) {
                     // Return a result that will cause another call to append.
@@ -342,7 +382,11 @@ public class RecordAccumulator {
                     // should be avoided.
                     nowMs = time.milliseconds();
                 }
-
+                /**
+                 * 步骤6 代码能够走到这里，可能有几种因素
+                 * 1. 没有分配Buffer，需要在这里分配空间
+                 * 2. batch已经满了，所以需要分配buffer重新添加
+                 */
                 synchronized (dq) {
                     // After taking the lock, validate that the partition hasn't changed and retry.
                     if (partitionChanged(topic, topicInfo, partitionInfo, dq, nowMs, cluster))
@@ -436,6 +480,7 @@ public class RecordAccumulator {
                                          Callback callback, Deque<ProducerBatch> deque, long nowMs) {
         if (closed)
             throw new KafkaException("Producer closed while send in progress");
+        // 获取最新加入的ProducerBatch
         ProducerBatch last = deque.peekLast();
         if (last != null) {
             int initialBytes = last.estimatedSizeInBytes();
@@ -613,10 +658,34 @@ public class RecordAccumulator {
     private long batchReady(long nowMs, boolean exhausted, TopicPartition part, Node leader,
                             long waitedTimeMs, boolean backingOff, boolean full,
                             long nextReadyCheckDelayMs, Set<Node> readyNodes) {
+        /**
+         *
+         */
         if (!readyNodes.contains(leader) && !isMuted(part)) {
             long timeToWaitMs = backingOff ? retryBackoffMs : lingerMs;
             boolean expired = waitedTimeMs >= timeToWaitMs;
             boolean transactionCompleting = transactionManager != null && transactionManager.isCompleting();
+            /**
+             * 在ready方法中，首先会遍历RecordAccumulator中存储的每个TopicPartition对应的deque，并拿到当前topicPartition的leader partition对应的Node，之后判断以下五个条件是否成立
+             * 1、full条件：
+             *      a、Deque 中有多个 RecordBatch，那从头取出来的ProducerBatch肯定是可以发送的
+             *      b、或是第一个 RecordBatch ，但是已满(batch.size)。
+             * 2、expired过期条件：
+             *      a、ProducerBatch等待时间已达到linger.ms设置时长
+             *      b、对于重试的ProducerBatch已达到重试间隔
+             * 3、exhausted条件：
+             *      a、exhausted=true，表示有线程在等待 BufferPool 释放空间（即 BufferPool 的空间耗尽了），所以也需要赶紧把ProducerBatch发送出去释放内存给这些阻塞的Producer存储新消息
+             * 4、closed:执行Producer.close()关闭操作，Sender线程也会关闭，需要尽快将ProducerBatch发送出去
+             * 5、flushInProgress：执行Producer.flush()刷新操作，也需要尽快将ProducerBatch发送出去
+             * 6、transactionCompleting：事务提交或异常终止
+             *
+             * 以上6个条件只要满足一个，那么这个node将被放入readyNodes中，最后该方法返回ReadyCheckResult，从上面看到ProducerBatch发送不一定batch.size或linger.ms
+             *
+             * 执行完ready方法后，Sender.sendProducerData()方法继续向下执行，依旧是做一些验证操作，对于找不到leader的partition，会强制去拉一次元数据，之后，
+             * 在发送消息之前，依旧会尝试与目标node建立连接，剔除一些无法ready的Node，避免报错，之后就开始执行RecordAccumulator.drain()方法，根据之前已经得到的readyNodes，
+             * 将ProducerBatch从RecordAccumulator中取出。
+             *
+             */
             boolean sendable = full
                     || expired
                     || exhausted
@@ -624,12 +693,17 @@ public class RecordAccumulator {
                     || flushInProgress()
                     || transactionCompleting;
             if (sendable && !backingOff) {
+                /**
+                 * backingOff=true：表示ProducerBatch是需要重试的，但是重试时间间隔未达到
+                 */
                 readyNodes.add(leader);
             } else {
+                // 计算剩余时间
                 long timeLeftMs = Math.max(timeToWaitMs - waitedTimeMs, 0);
                 // Note that this results in a conservative estimate since an un-sendable partition may have
                 // a leader that will later be found to have sendable data. However, this is good enough
                 // since we'll just wake up and then sleep again for the remaining time.
+                //选取一个最小剩余时间作为下次ready时间
                 nextReadyCheckDelayMs = Math.min(timeLeftMs, nextReadyCheckDelayMs);
             }
         }
@@ -668,12 +742,14 @@ public class RecordAccumulator {
         }
 
         int queueSizesIndex = -1;
+        // 是否有线程在等待 BufferPool 分配空间
         boolean exhausted = this.free.queued() > 0;
+        // 遍历每个 topic 分区及其 RecordBatch 队列，对每个分区的 leader 副本所在的节点执行判定
         for (Map.Entry<Integer, Deque<ProducerBatch>> entry : batches.entrySet()) {
             TopicPartition part = new TopicPartition(topic, entry.getKey());
             // Advance queueSizesIndex so that we properly index available
             // partitions.  Do it here so that it's done for all code paths.
-
+            // 获取当前 topic 分区 leader 副本所在的节点
             Metadata.LeaderAndEpoch leaderAndEpoch = metadata.currentLeader(part);
             Node leader = leaderAndEpoch.leader.orElse(null);
             if (leader != null && queueSizes != null) {
@@ -702,17 +778,27 @@ public class RecordAccumulator {
                 if (batch == null) {
                     continue;
                 }
-
+                //这个批次已经等了多久
                 waitedTimeMs = batch.waitedTimeMs(nowMs);
                 batch.maybeUpdateLeaderEpoch(leaderAndEpoch.epoch);
+
+                /**
+                 * backingOff=true：表示规避期间，即需要重试，但是重试间隔未达到retryBackoffMs
+                 */
                 backingOff = shouldBackoff(batch.hasLeaderChangedForTheOngoingRetry(), batch, waitedTimeMs);
                 dequeSize = deque.size();
+                /**
+                 * ProducerBatch如果full就可以发送，full条件：
+                 * 1、Deque队列中包含多个ProducerBatch，第一个ProducerBatch肯定是可以发送的
+                 * 2、Deque队列中只有一个ProducerBatch，但是该batch已满
+                 */
                 full = dequeSize > 1 || batch.isFull();
             }
 
             if (leader == null) {
                 // This is a partition for which leader is not known, but messages are available to send.
                 // Note that entries are currently not removed from batches when deque is empty.
+                // 当前分区 leader 副本未知，但存在发往该分区的消息
                 unknownLeaderTopics.add(part.topic());
             } else {
                 if (queueSizes != null)
@@ -766,7 +852,9 @@ public class RecordAccumulator {
      */
     public ReadyCheckResult ready(Metadata metadata, long nowMs) {
         Set<Node> readyNodes = new HashSet<>();
+        // 记录下次执行 ready 判断的时间间隔
         long nextReadyCheckDelayMs = Long.MAX_VALUE;
+        // 记录找不到 leader 副本的分区对应的 topic 集合
         Set<String> unknownLeaderTopics = new HashSet<>();
         // Go topic by topic so that we can get queue sizes for partitions in a topic and calculate
         // cumulative frequency table (used in partitioner).
@@ -843,15 +931,28 @@ public class RecordAccumulator {
         return false;
     }
 
+    /**
+     * 取节点对应的batch列表
+     * 该方法展现了Sender是如何从accumulator中取出待发送的数据，可以简述为：在计算得出可发送的节点后，获取每个节点持有leader的分片，从这些分片对应的队列中各自至多取出一个batch，得出每个节点需要发送的batch列表。
+     *
+     * @param metadata
+     * @param node
+     * @param maxSize
+     * @param now
+     * @return
+     */
     private List<ProducerBatch> drainBatchesForOneNode(Metadata metadata, Node node, int maxSize, long now) {
         int size = 0;
+        // 根据集群元数据信息获取节点拥有leader的分片信息
         List<PartitionInfo> parts = metadata.fetch().partitionsForNode(node.id());
         List<ProducerBatch> ready = new ArrayList<>();
         if (parts.isEmpty())
             return ready;
         /* to make starvation less likely each node has it's own drainIndex */
         int drainIndex = getDrainIndex(node.idString());
+        // drainIndex是个成员变量，这里的操作是为了防止一直从第一个分片开始遍历产生饥饿
         int start = drainIndex = drainIndex % parts.size();
+        // 循环每个分片对应的队列
         do {
             PartitionInfo part = parts.get(drainIndex);
 
@@ -873,8 +974,10 @@ public class RecordAccumulator {
                 continue;
 
             final ProducerBatch batch;
+            // 对队列的操作都在同步块内部
             synchronized (deque) {
                 // invariant: !isMuted(tp,now) && deque != null
+                // 取队列头部batch进行判断
                 ProducerBatch first = deque.peekFirst();
                 if (first == null)
                     continue;
@@ -888,8 +991,10 @@ public class RecordAccumulator {
                 if (size + first.estimatedSizeInBytes() > maxSize && !ready.isEmpty()) {
                     // there is a rare case that a single batch size is larger than the request size due to
                     // compression; in this case we will still eventually send this batch in a single request
+                    // 如果超过了请求体的大小限制，直接跳出循环
                     break;
                 } else {
+                    // 事务相关条件判断
                     if (shouldStopDrainBatchesForPartition(first, tp))
                         break;
                 }
@@ -926,11 +1031,12 @@ public class RecordAccumulator {
 
             // the rest of the work by processing outside the lock
             // close() is particularly expensive
-
+            // 关闭batch，阻止数据继续写入batch
             batch.close();
             size += batch.records().sizeInBytes();
             ready.add(batch);
 
+            // 更新batch被poll出队列的时间，用于计算batch创建到发送在Deque中停留的时长
             batch.drained(now);
         } while (start != drainIndex);
         return ready;

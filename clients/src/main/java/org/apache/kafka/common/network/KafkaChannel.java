@@ -123,7 +123,13 @@ public class KafkaChannel implements AutoCloseable {
     private final int maxReceiveSize;
     private final MemoryPool memoryPool;
     private final ChannelMetadataRegistry metadataRegistry;
+    /**
+     * 读缓存，底层使用ByteBuffer实现
+     */
     private NetworkReceive receive;
+    /**
+     * 缓存，底层使用ByteBuffer实现
+     */
     private NetworkSend send;
     // Track connection and mute state of channels to enable outstanding requests on channels to be
     // processed after the channel is disconnected.
@@ -379,7 +385,9 @@ public class KafkaChannel implements AutoCloseable {
     public void setSend(NetworkSend send) {
         if (this.send != null)
             throw new IllegalStateException("Attempt to begin a send operation with prior send operation still in progress, connection id is " + id);
+        //往KafkaChannel里面绑定一个发送出去的请求。
         this.send = send;
+        //这儿绑定了一个OP_WRITE事件，一旦绑定了这个事件以后，我们就可以往服务端发送请求了。
         this.transportLayer.addInterestOps(SelectionKey.OP_WRITE);
     }
 

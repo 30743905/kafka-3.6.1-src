@@ -818,9 +818,11 @@ public class MemoryRecordsBuilder implements AutoCloseable {
             return false;
 
         // We always allow at least one record to be appended (the ByteBufferOutputStream will grow as needed)
+        // 至少保证batch中包含一个record
         if (numRecords == 0)
             return true;
 
+        // 计算record大小
         final int recordSize;
         if (magic < RecordBatch.MAGIC_VALUE_V2) {
             recordSize = Records.LOG_OVERHEAD + LegacyRecord.recordSize(magic, key, value);
@@ -831,6 +833,12 @@ public class MemoryRecordsBuilder implements AutoCloseable {
         }
 
         // Be conservative and not take compression of the new record into consideration.
+        /**
+         * writeLimit：batch.size
+         * estimatedBytesWritten：batch中已写入字节数
+         * recordSize：当前record字节数
+         * estimatedBytesWritten() + recordSize <= writeLimit：则表示最新batch中还可以存储下当前record
+         */
         return this.writeLimit >= estimatedBytesWritten() + recordSize;
     }
 
