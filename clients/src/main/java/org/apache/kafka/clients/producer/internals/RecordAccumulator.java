@@ -281,7 +281,7 @@ public class RecordAccumulator {
                                      Header[] headers,
                                      AppendCallbacks callbacks,
                                      long maxTimeToBlock,
-                                     boolean abortOnNewBatch11,
+                                     boolean abortOnNewBatch,
                                      long nowMs,
                                      Cluster cluster) throws InterruptedException {
         /**

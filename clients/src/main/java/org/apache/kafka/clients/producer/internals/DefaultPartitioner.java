@@ -67,9 +67,10 @@ public class DefaultPartitioner implements Partitioner {
      */
     public int partition(String topic, Object key, byte[] keyBytes, Object value, byte[] valueBytes, Cluster cluster,
                          int numPartitions) {
-        if (keyBytes == null) {
+        if (keyBytes == null) {//没有key时使用粘性分区策略（2.4.0版本开始），也就是UniformStickyPartitioner
             return stickyPartitionCache.partition(topic, cluster);
         }
+        //根据序列化key使用murmur2哈希算法对分区数取模
         return BuiltInPartitioner.partitionForKey(keyBytes, numPartitions);
     }
 
