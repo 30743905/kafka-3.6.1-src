@@ -435,8 +435,10 @@ class LocalLog(@volatile private var _dir: File,
   }
 
   private[log] def append(lastOffset: Long, largestTimestamp: Long, shallowOffsetOfMaxTimestamp: Long, records: MemoryRecords): Unit = {
+    // 真正append日志的是LogSegment对象
     segments.activeSegment.append(largestOffset = lastOffset, largestTimestamp = largestTimestamp,
       shallowOffsetOfMaxTimestamp = shallowOffsetOfMaxTimestamp, records = records)
+    // 更新LEO，lastOffset + 1
     updateLogEndOffset(lastOffset + 1)
   }
 
@@ -494,7 +496,9 @@ class LocalLog(@volatile private var _dir: File,
     maybeHandleIOException(s"Error while rolling log segment for $topicPartition in dir ${dir.getParent}") {
       val start = time.hiResClockMs()
       checkIfMemoryMappedBufferClosed()
+      //note: 选择最新的 offset 作为基准偏移量
       val newOffset = math.max(expectedNextOffset.getOrElse(0L), logEndOffset)
+      //note: 创建数据文件
       val logFile = LogFileUtils.logFile(dir, newOffset, "")
       val activeSegment = segments.activeSegment
       if (segments.contains(newOffset)) {
@@ -506,6 +510,7 @@ class LocalLog(@volatile private var _dir: File,
             s"=max(provided offset = $expectedNextOffset, LEO = $logEndOffset) while it already " +
             s"exists and is active with size 0. Size of time index: ${activeSegment.timeIndex.entries}," +
             s" size of offset index: ${activeSegment.offsetIndex.entries}.")
+          //note: 创建一个 segment 对象
           val newSegment = createAndDeleteSegment(newOffset, activeSegment, asyncDelete = true, LogRoll(this))
           updateLogEndOffset(nextOffsetMetadata.messageOffset)
           info(s"Rolled new log segment at offset $newOffset in ${time.hiResClockMs() - start} ms.")

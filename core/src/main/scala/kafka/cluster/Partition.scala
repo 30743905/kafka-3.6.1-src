@@ -1300,22 +1300,27 @@ class Partition(val topicPartition: TopicPartition,
     val (info, leaderHWIncremented) = inReadLock(leaderIsrUpdateLock) {
       leaderLogIfLocal match {
         case Some(leaderLog) =>
+          //获取配置参数中ISR集合中replica的最小个数
           val minIsr = leaderLog.config.minInSyncReplicas
           val inSyncSize = partitionState.isr.size
 
           // Avoid writing to leader if there are not enough insync replicas to make it safe
+          //如果ack 设置为-1, 且isr数小于设置的min.isr 时,抛出相应的异常
           if (inSyncSize < minIsr && requiredAcks == -1) {
             throw new NotEnoughReplicasException(s"The size of the current ISR ${partitionState.isr} " +
               s"is insufficient to satisfy the min.isr requirement of $minIsr for partition $topicPartition")
           }
 
+          //向Log对象中追加record
           val info = leaderLog.appendAsLeader(records, leaderEpoch = this.leaderEpoch, origin,
             interBrokerProtocolVersion, requestLocal, verificationGuard)
 
           // we may need to increment high watermark since ISR could be down to 1
+          //判断是否需要增加 HW（追加日志后会进行一次判断）
           (info, maybeIncrementLeaderHW(leaderLog))
 
         case None =>
+          //note: leader 不在本台机器上
           throw new NotLeaderOrFollowerException("Leader not local for partition %s on broker %d"
             .format(topicPartition, localBrokerId))
       }

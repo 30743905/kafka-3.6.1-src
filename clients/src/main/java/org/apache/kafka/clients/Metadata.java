@@ -60,18 +60,40 @@ import static org.apache.kafka.common.record.RecordBatch.NO_PARTITION_LEADER_EPO
  */
 public class Metadata implements Closeable {
     private final Logger log;
+    //两个更新元数据的请求的最小的时间间隔，默认值是100ms，目的就是减少网络的压力
     private final long refreshBackoffMs;
+    /**
+     * metadata.max.age，默认300000，即5分钟
+     * 以毫秒为单位的时间段之后，即使我们没有看到任何分区改变以主动发现任何新代理或分区，我们强制更新元数据。
+     */
     private final long metadataExpireMs;
     private int updateVersion;  // bumped on every metadata response
     private int requestVersion; // bumped on every new topic addition
+    // 上一次更新元数据的时间戳
     private long lastRefreshMs;
+    /**
+     * 上一次成功更新元数据的时间戳，如果每次更新都成功，
+     * lastSuccessfulRefreshMs应该与lastRefreshMs相同，否则lastRefreshMs > lastSuccessfulRefreshMs
+     */
     private long lastSuccessfulRefreshMs;
     private KafkaException fatalException;
     private Set<String> invalidTopics;
     private Set<String> unauthorizedTopics;
     private MetadataCache cache = MetadataCache.empty();
+    /**
+     * 全部主题更新，即发送Metadata请求时将topics列表中主题都传递给broker
+     * 则topics列表中涉及的主题的元数据都会更新过来
+     */
     private boolean needFullUpdate;
+    /**
+     * 局部更新，即发送Metadata请求时将newTopics列表中新增主题传递给broker
+     * 则newTopics列表中涉及的主题的元数据都会更新过来
+     */
     private boolean needPartialUpdate;
+    /**
+     * 序列器、拦截器等实现ClusterResourceListener接口，则元数据更新完成后会回调方法：onUpdate(ClusterResource clusterResource)
+     * 用于监听Metadata更新
+     */
     private final ClusterResourceListeners clusterResourceListeners;
     private boolean isClosed;
     private final Map<TopicPartition, Integer> lastSeenLeaderEpochs;

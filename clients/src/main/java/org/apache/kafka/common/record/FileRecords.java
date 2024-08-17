@@ -260,12 +260,16 @@ public class FileRecords extends AbstractRecords implements Closeable {
      * It is expected that no other threads will do writes to the log when this function is called.
      * @param targetSize The size to truncate to. Must be between 0 and sizeInBytes.
      * @return The number of bytes truncated off
+     *
+     * Kafka 会将日志段当前总字节数和刚刚累加的已读取字节数进行比较，如果发现前者比后者大，说明日志段写入了一些非法消息，需要执行截断操作，将日志段大小调整回合法的数值。
      */
     public int truncateTo(int targetSize) throws IOException {
         int originalSize = sizeInBytes();
+        // 要截断的目标大小不能超过当前文件的大小
         if (targetSize > originalSize || targetSize < 0)
             throw new KafkaException("Attempt to truncate log segment " + file + " to " + targetSize + " bytes failed, " +
                     " size of this log segment is " + originalSize + " bytes.");
+        //如果目标大小小于当前文件大小，那么执行截断
         if (targetSize < (int) channel.size()) {
             channel.truncate(targetSize);
             size.set(targetSize);

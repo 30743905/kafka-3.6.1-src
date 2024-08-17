@@ -134,9 +134,15 @@ public class MemoryRecordsBuilder implements AutoCloseable {
         this.writeLimit = writeLimit;
         this.initialPosition = bufferStream.position();
         this.batchHeaderSizeInBytes = AbstractRecords.recordBatchHeaderSizeInBytes(magic, compressionType);
-
+        // Buffer一开始就需要预留61B的位置用于 存放消息投 RecordHeader
+        // batchHeaderSizeInBytes = 61
         bufferStream.position(initialPosition + batchHeaderSizeInBytes);
         this.bufferStream = bufferStream;
+        /**
+         * 选择合适的压缩器实现类
+         * 根据配置的压缩类型compression.type,选择对应的压缩输出流。
+         * 例如假设使用lz4压缩类型,返回的输出流实体对象为KafkaLZ4BlockOutputStream, 这里面有写入消息的方法和压缩方法。
+         */
         this.appendStream = new DataOutputStream(compressionType.wrapForOutput(this.bufferStream, magic));
 
         if (hasDeleteHorizonMs()) {
@@ -225,6 +231,13 @@ public class MemoryRecordsBuilder implements AutoCloseable {
     }
 
     public boolean hasDeleteHorizonMs() {
+        /**
+         * deleteHorizonMs计算方式:
+         * deleteHorizonMs = clean部分中最后一个LogSegment的lastModifiedTime - deleteRetionMs(log.cleaner.delete.retention.ms)
+         *
+         * log.cleaner.delete.retention.ms：对于压缩的日志保留的最长时间
+         * 对于压缩的日志保留的最长时间，也是客户端消费消息的最长时间，同log.retention.minutes的区别在于一个控制未压缩数据，一个控制压缩后的数据。会被topic创建时的指定参数覆盖
+         */
         return magic >= RecordBatch.MAGIC_VALUE_V2 && deleteHorizonMs >= 0L;
     }
 
@@ -387,10 +400,15 @@ public class MemoryRecordsBuilder implements AutoCloseable {
     private int writeDefaultBatchHeader() {
         ensureOpenForRecordBatchWrite();
         ByteBuffer buffer = bufferStream.buffer();
+        //当前buffer的位置
         int pos = buffer.position();
+        //将位置移动到初始位置0
         buffer.position(initialPosition);
+        //大小
         int size = pos - initialPosition;
+        //已压缩的大小
         int writtenCompressed = size - DefaultRecordBatch.RECORD_BATCH_OVERHEAD;
+        // 偏移量增量
         int offsetDelta = (int) (lastOffset - baseOffset);
 
         final long maxTimestamp;
@@ -398,11 +416,11 @@ public class MemoryRecordsBuilder implements AutoCloseable {
             maxTimestamp = logAppendTime;
         else
             maxTimestamp = this.maxTimestamp;
-
+        //将RecordBatch 消息头写入buffer
         DefaultRecordBatch.writeHeader(buffer, baseOffset, offsetDelta, size, magic, compressionType, timestampType,
                 baseTimestamp, maxTimestamp, producerId, producerEpoch, baseSequence, isTransactional, isControlBatch,
                 hasDeleteHorizonMs(), partitionLeaderEpoch, numRecords);
-
+        //重新定位
         buffer.position(pos);
         return writtenCompressed;
     }
@@ -720,9 +738,13 @@ public class MemoryRecordsBuilder implements AutoCloseable {
     private void appendDefaultRecord(long offset, long timestamp, ByteBuffer key, ByteBuffer value,
                                      Header[] headers) throws IOException {
         ensureOpenForRecordAppend();
+        // offset增量
         int offsetDelta = (int) (offset - baseOffset);
+        // 时间增量
         long timestampDelta = timestamp - baseTimestamp;
+        //将数据 写到appendStream中
         int sizeInBytes = DefaultRecord.writeTo(appendStream, offsetDelta, timestampDelta, key, value, headers);
+        // 记录一下 写入了多少数据
         recordWritten(offset, timestamp, sizeInBytes);
     }
 

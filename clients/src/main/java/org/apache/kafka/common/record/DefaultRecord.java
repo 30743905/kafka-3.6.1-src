@@ -193,7 +193,7 @@ public class DefaultRecord implements Record {
         if (headers == null)
             throw new IllegalArgumentException("Headers cannot be null");
 
-        ByteUtils.writeVarint(headers.length, out);
+            ByteUtils.writeVarint(headers.length, out);
 
         for (Header header : headers) {
             String headerKey = header.key();

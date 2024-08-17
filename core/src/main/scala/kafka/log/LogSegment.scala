@@ -69,7 +69,14 @@ class LogSegment private[log] (val log: FileRecords,
   def timeIndex: TimeIndex = lazyTimeIndex.get
 
   def shouldRoll(rollParams: RollParams): Boolean = {
+    //note: 距离上次日志分段的时间是否达到了设置的阈值（log.roll.hours）
     val reachedRollMs = timeWaitedForRoll(rollParams.now, rollParams.maxTimestampInMessages) > rollParams.maxSegmentMs - rollJitterMs
+    //这是五个条件,其中一个条件，就会创建新的 segment 文件:
+    // 1. 当前日志分段的大小加上消息的大小超过了日志分段的阈值（log.segment.bytes）
+    // 2. 离上次创建日志分段的时间达到了一定的阈值（log.roll.hours），并且数据文件有数据
+    // 3. 索引文件满了;
+    // 4. 时间索引文件满了;
+    // 5. 最大的 offset，其相对偏移量超过了正整数的阈值
     size > rollParams.maxSegmentBytes - rollParams.messagesSize ||
       (size > 0 && reachedRollMs) ||
       offsetIndex.isFull || timeIndex.isFull || !canConvertToRelativeOffset(rollParams.maxOffsetInMessages)
@@ -92,10 +99,11 @@ class LogSegment private[log] (val log: FileRecords,
     }
     else throw new NoSuchFileException(s"Offset index file ${lazyOffsetIndex.file.getAbsolutePath} does not exist")
   }
-
+  /** 当前 LogSegment 的创建时间 */
   private var created = time.milliseconds
 
   /* the number of bytes since we last added an entry in the offset index */
+  /** 自上次添加索引项后，在 log 文件中累计加入的消息字节数 */
   private var bytesSinceLastIndexEntry = 0
 
   // The timestamp we used for time based log rolling and for ensuring max compaction delay
@@ -112,6 +120,7 @@ class LogSegment private[log] (val log: FileRecords,
   }
 
   /* The maximum timestamp we see so far */
+  /** 已追加消息的最大时间戳 */
   def maxTimestampSoFar: Long = {
     maxTimestampAndOffsetSoFar.timestamp
   }
@@ -137,14 +146,15 @@ class LogSegment private[log] (val log: FileRecords,
    * It is assumed this method is being called from within a lock.
    *
    * @param largestOffset The last offset in the message set
-   *                      待写入的一个批次的消息的最大位移值
    * @param largestTimestamp The largest timestamp in the message set.
-   *                         待写入的一个批次的消息的最大时间戳
    * @param shallowOffsetOfMaxTimestamp The offset of the message that has the largest timestamp in the messages to append.
-   *                                    待写入的一个批次的消息的最大时间戳对应消息的位移
    * @param records The log entries to append.
-   *                待写入的消息集合
    * @throws LogSegmentOffsetOverflowException if the largest offset causes index offset overflow
+   *
+   *   largestOffset: 待追加消息中的最大 offset
+   *   largestTimestamp: 待追加消息中的最大时间戳
+   *   shallowOffsetOfMaxTimestamp: 最大时间戳消息对应的 offset
+   *   records: MemoryRecords类型， 待追加的消息集合
    */
   @nonthreadsafe
   def append(largestOffset: Long,
@@ -158,7 +168,7 @@ class LogSegment private[log] (val log: FileRecords,
 
       // 判断当前日志段是否为空
       // 如果是空，则记录要写入消息集合的最大时间戳，并将其作为后面新增日志段倒计时的依据
-      val physicalPosition = log.sizeInBytes()
+      val physicalPosition = log.sizeInBytes() // 获取物理位置（当前分片的大小）
       if (physicalPosition == 0)
         rollingBasedTimestamp = Some(largestTimestamp)
 
@@ -170,15 +180,19 @@ class LogSegment private[log] (val log: FileRecords,
       val appendedBytes = log.append(records)
       trace(s"Appended $appendedBytes to ${log.file} at end offset $largestOffset")
       // Update the in memory max timestamp and corresponding offset.
-      //4、更新内存中的最大时间戳和相应的偏移量
-      //每个日志段都要保存当前最大时间戳和所属消息的偏移信息
-      //Broker 端提供有定期删除日志的功能。比如我只想保留最近 7 天日志，就是基于当前最大时间戳值。
-      //而最大时间戳对应的消息的偏移值则用于时间戳索引项。时间戳索引项保存时间戳与消息偏移的对应关系。该步骤中，Kafka更新并保存这组对应关系。
+      /**
+       * 4、更新内存中已追加的消息对应的最大时间戳和相应的偏移量offset
+       * 每个日志段都要保存当前最大时间戳和所属消息的偏移信息，Broker 端提供有定期删除日志的功能。比如我只想保留最近 7 天日志，就是基于当前最大时间戳值。
+       * 而最大时间戳对应的消息的偏移值则用于时间戳索引项。时间戳索引项保存时间戳与消息偏移的对应关系。
+       */
       if (largestTimestamp > maxTimestampSoFar) {
         maxTimestampAndOffsetSoFar = new TimestampOffset(largestTimestamp, shallowOffsetOfMaxTimestamp)
       }
       // append an entry to the index (if needed)
-      //5、判断是否需要新增索引项，标准：已写入字节数是否超过4KB
+      /**
+       * 5、判断是否需要新增索引项
+       * 如果当前累计追加的日志字节数超过阈值（对应 index.interval.bytes 配置），才会写offset索引文件和time索引文件
+       */
       if (bytesSinceLastIndexEntry > indexIntervalBytes) {
         //调用索引对象的append方法新增偏移、时间戳索引项
         // 当已写入字节数超过了 4KB 之后，append方法会调用索引对象的append方法新增索引项，同时清空已写入字节数，以备下次重新累积计算
@@ -394,12 +408,13 @@ class LogSegment private[log] (val log: FileRecords,
 
         // The max timestamp is exposed at the batch level, so no need to iterate the records
         //最大时间戳在批处理级别暴漏，因此无需迭代记录
+        // 获取最大时间戳及所属消息位移
         if (batch.maxTimestamp > maxTimestampSoFar) {
           maxTimestampAndOffsetSoFar = new TimestampOffset(batch.maxTimestamp, batch.lastOffset)
         }
 
         // Build offset index
-        // 简历偏移索引
+        // 当已写入字节数超过了 4KB 之后，调用索引对象的 append 方法新增索引项，同时清空已写入字节数
         if (validBytes - lastIndexEntry > indexIntervalBytes) {
           offsetIndex.append(batch.lastOffset, validBytes)
           timeIndex.maybeAppend(maxTimestampSoFar, offsetOfMaxTimestampSoFar)
@@ -432,7 +447,7 @@ class LogSegment private[log] (val log: FileRecords,
     val truncated = log.sizeInBytes - validBytes
     if (truncated > 0)
       debug(s"Truncated $truncated invalid bytes at the end of segment ${log.file.getAbsoluteFile} during recovery")
-
+    //执行日志截断操作
     log.truncateTo(validBytes)
     //截断处理后，还必须相应地调整索引文件大小
     offsetIndex.trimToValidSize()

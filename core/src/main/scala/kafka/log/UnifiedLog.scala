@@ -800,6 +800,7 @@ class UnifiedLog(@volatile var logStartOffset: Long,
                 origin,
                 interBrokerProtocolVersion
               )
+              //todo
               validator.validateMessagesAndAssignOffsets(offset,
                 validatorMetricsRecorder,
                 requestLocal.getOrElse(throw new IllegalArgumentException(
@@ -823,6 +824,7 @@ class UnifiedLog(@volatile var logStartOffset: Long,
             // format conversion)
             if (!ignoreRecordSize && validateAndOffsetAssignResult.messageSizeMaybeChanged) {
               validRecords.batches.forEach { batch =>
+                // 每一批消息不能比max.message.bytes大
                 if (batch.sizeInBytes > config.maxMessageSize) {
                   // we record the original message set size instead of the trimmed size
                   // to be consistent with pre-compression bytesRejectedRate recording
@@ -872,14 +874,19 @@ class UnifiedLog(@volatile var logStartOffset: Long,
           }
 
           // check messages set size may be exceed config.segmentSize
+          // MemoryRecords总消息不能比segment.bytes大
           if (validRecords.sizeInBytes > config.segmentSize) {
             throw new RecordBatchTooLargeException(s"Message batch size is ${validRecords.sizeInBytes} bytes in append " +
               s"to partition $topicPartition, which exceeds the maximum configured segment size of ${config.segmentSize}.")
           }
 
           // maybe roll the log if this segment is full
+          /**
+           * 判断是否需要创建日志分段,如果不需要返回当前分段,需要的话,返回新创建的日志分段
+           */
           val segment = maybeRoll(validRecords.sizeInBytes, appendInfo)
 
+          // 保存位移的VO
           val logOffsetMetadata = new LogOffsetMetadata(
             appendInfo.firstOrLastOffsetOfFirstBatch,
             segment.baseOffset,
@@ -908,6 +915,7 @@ class UnifiedLog(@volatile var logStartOffset: Long,
               // will be cleaned up after the log directory is recovered. Note that the end offset of the
               // ProducerStateManager will not be updated and the last stable offset will not advance
               // if the append to the transaction index fails.
+              // 真正append日志的是LogSegment对象
               localLog.append(appendInfo.lastOffset, appendInfo.maxTimestamp, appendInfo.offsetOfMaxTimestamp, validRecords)
               updateHighWatermarkWithLogEndOffset()
 
@@ -1561,7 +1569,9 @@ class UnifiedLog(@volatile var logStartOffset: Long,
    *
    * @return  The currently active segment after (perhaps) rolling to a new segment
    */
+  //note: 判断是否需要创建日志分段,如果不需要返回当前分段,需要的话,返回新创建的日志分段
   private def maybeRoll(messagesSize: Int, appendInfo: LogAppendInfo): LogSegment = lock synchronized {
+    //note: 对活跃的日志分段进行判断,它也是最新的一个日志分段
     val segment = localLog.segments.activeSegment
     val now = time.milliseconds
 
@@ -1591,9 +1601,9 @@ class UnifiedLog(@volatile var logStartOffset: Long,
         .map[Long](_.messageOffset)
         .orElse(maxOffsetInMessages - Integer.MAX_VALUE)
 
-      roll(Some(rollOffset))
+      roll(Some(rollOffset)) //note: 创建新的日志分段
     } else {
-      segment
+      segment //note: 使用当前的日志分段
     }
   }
 
@@ -1604,6 +1614,7 @@ class UnifiedLog(@volatile var logStartOffset: Long,
    *
    * @return The newly rolled segment
    */
+  //note: 滚动创建日志,并添加到日志管理的映射表中
   def roll(expectedNextOffset: Option[Long] = None): LogSegment = lock synchronized {
     val newSegment = localLog.roll(expectedNextOffset)
     // Take a snapshot of the producer state to facilitate recovery. It is useful to have the snapshot

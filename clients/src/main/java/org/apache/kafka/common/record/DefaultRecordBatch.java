@@ -418,19 +418,37 @@ public class DefaultRecordBatch extends AbstractRecordBatch implements MutableRe
         return buffer != null ? buffer.hashCode() : 0;
     }
 
+    /**
+     * 消息的属性,这里用了2个字节, 低3位表示压缩格式,第4位表示时间戳,第5位表示事务标识,第6位表示是否控制消息。
+     *
+     * @param type
+     * @param timestampType
+     * @param isTransactional
+     * @param isControl
+     * @param isDeleteHorizonSet
+     * @return
+     */
     private static byte computeAttributes(CompressionType type, TimestampType timestampType,
                                           boolean isTransactional, boolean isControl, boolean isDeleteHorizonSet) {
         if (timestampType == TimestampType.NO_TIMESTAMP_TYPE)
             throw new IllegalArgumentException("Timestamp type must be provided to compute attributes for message " +
                     "format v2 and above");
-
+        //如果支持事务，第5位标识置为1
         byte attributes = isTransactional ? TRANSACTIONAL_FLAG_MASK : 0;
+        /**
+         * 如果是控制数据，第6位置为1
+         * 标识该batch是否为控制数据，例如事务标记就是控制数据数据
+         * 因为该batch写入后，不一定consumer可以看得见，可能要多个batch成功写入才能被consumer消费看到
+         */
         if (isControl)
             attributes |= CONTROL_FLAG_MASK;
+        //低3位标识压缩类型
         if (type.id > 0)
             attributes |= (byte) (COMPRESSION_CODEC_MASK & type.id);
+        //第4位表示时间戳，如果是LOG_APPEND_TIME，第4位置为1
         if (timestampType == TimestampType.LOG_APPEND_TIME)
             attributes |= TIMESTAMP_TYPE_MASK;
+        //第7位标识 墓碑消息（tombstone）相关
         if (isDeleteHorizonSet)
             attributes |= DELETE_HORIZON_FLAG_MASK;
         return attributes;
@@ -476,6 +494,9 @@ public class DefaultRecordBatch extends AbstractRecordBatch implements MutableRe
         if (baseTimestamp < 0 && baseTimestamp != NO_TIMESTAMP)
             throw new IllegalArgumentException("Invalid message timestamp " + baseTimestamp);
 
+        /**
+         *
+         */
         short attributes = computeAttributes(compressionType, timestampType, isTransactional, isControlBatch, isDeleteHorizonSet);
 
         int position = buffer.position();
@@ -491,6 +512,11 @@ public class DefaultRecordBatch extends AbstractRecordBatch implements MutableRe
         buffer.putShort(position + PRODUCER_EPOCH_OFFSET, epoch);
         buffer.putInt(position + BASE_SEQUENCE_OFFSET, sequence);
         buffer.putInt(position + RECORDS_COUNT_OFFSET, numRecords);
+
+        /**
+         * 可以看到CRC的计算,是在最后面的时候计算,然后填充到buffer里面的,但是这个并不意味着crc32是放在最后一个, CRC_OFFSET的位置是17的位置
+         * crc计算是从attributes字段开始到整个RecordBatch结尾
+         */
         long crc = Crc32C.compute(buffer, ATTRIBUTES_OFFSET, sizeInBytes - ATTRIBUTES_OFFSET);
         buffer.putInt(position + CRC_OFFSET, (int) crc);
         buffer.position(position + RECORD_BATCH_OVERHEAD);

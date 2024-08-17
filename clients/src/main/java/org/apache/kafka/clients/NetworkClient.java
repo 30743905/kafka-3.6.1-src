@@ -1009,6 +1009,7 @@ public class NetworkClient implements KafkaClient {
          *  3、把ClientResponse放入List<ClientResponse>中
          */
         for (NetworkReceive receive : this.selector.completedReceives()) {
+            //source就是node标识
             String source = receive.source();
             //从数据结构里面移除已经接收到响应的请求。
             //把之前存入进去的请求也获取到了

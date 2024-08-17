@@ -562,19 +562,23 @@ class KafkaApis(val requestChannel: RequestChannel,
    * Handle a produce request
    */
   def handleProduceRequest(request: RequestChannel.Request, requestLocal: RequestLocal): Unit = {
+    // 转换为具体的请求对象
     val produceRequest = request.body[ProduceRequest]
 
+    //produceRequest是否含有事务
     if (RequestUtils.hasTransactionalRecords(produceRequest)) {
       val isAuthorizedTransactional = produceRequest.transactionalId != null &&
         authHelper.authorize(request.context, WRITE, TRANSACTIONAL_ID, produceRequest.transactionalId)
-      if (!isAuthorizedTransactional) {
+      if (!isAuthorizedTransactional) {//如果事务未开启授权
         requestHelper.sendErrorResponseMaybeThrottle(request, Errors.TRANSACTIONAL_ID_AUTHORIZATION_FAILED.exception)
         return
       }
     }
-
+    //未授权topic的response
     val unauthorizedTopicResponses = mutable.Map[TopicPartition, PartitionResponse]()
+    //不存在topic的response
     val nonExistingTopicResponses = mutable.Map[TopicPartition, PartitionResponse]()
+    //无效请求的response
     val invalidRequestResponses = mutable.Map[TopicPartition, PartitionResponse]()
     val authorizedRequestInfo = mutable.Map[TopicPartition, MemoryRecords]()
     // cache the result to avoid redundant authorization calls
@@ -588,12 +592,17 @@ class KafkaApis(val requestChannel: RequestChannel,
       // https://issues.apache.org/jira/browse/KAFKA-10698
       val memoryRecords = partition.records.asInstanceOf[MemoryRecords]
       if (!authorizedTopics.contains(topicPartition.topic))
+        //如果判断topic未授权，生成未授权topic的response
         unauthorizedTopicResponses += topicPartition -> new PartitionResponse(Errors.TOPIC_AUTHORIZATION_FAILED)
       else if (!metadataCache.contains(topicPartition))
+        //如果判断broker的元数据缓存不包含该topicPartition，生成不存在topic的response
         nonExistingTopicResponses += topicPartition -> new PartitionResponse(Errors.UNKNOWN_TOPIC_OR_PARTITION)
       else
         try {
+          //对 Produce 请求携带的每一条消息数据进行有效性校验
+          //由于 Kakfa 各个版本的消息结构有差异，这部分其实主要是进行消息结构的版本兼容性校验，没有太多逻辑
           ProduceRequest.validateRecords(request.header.apiVersion, memoryRecords)
+          //如果brocker的元数据缓存包含该topicPartition，将该二元组添加到authorizedRequestInfo的map集合
           authorizedRequestInfo += (topicPartition -> memoryRecords)
         } catch {
           case e: ApiException =>
@@ -605,8 +614,10 @@ class KafkaApis(val requestChannel: RequestChannel,
     // The construction of ProduceResponse is able to accept auto-generated protocol data so
     // KafkaApis#handleProduceRequest should apply auto-generated protocol to avoid extra conversion.
     // https://issues.apache.org/jira/browse/KAFKA-10730
+    // 嵌套方法，定义响应回调
     @nowarn("cat=deprecation")
     def sendResponseCallback(responseStatus: Map[TopicPartition, PartitionResponse]): Unit = {
+      // ++表示集合合并
       val mergedResponseStatus = responseStatus ++ unauthorizedTopicResponses ++ nonExistingTopicResponses ++ invalidRequestResponses
       var errorInResponse = false
 
@@ -628,7 +639,7 @@ class KafkaApis(val requestChannel: RequestChannel,
       val requestSize = request.sizeInBytes
       val bandwidthThrottleTimeMs = quotas.produce.maybeRecordAndGetThrottleTimeMs(request, requestSize, timeMs)
       val requestThrottleTimeMs =
-        if (produceRequest.acks == 0) 0
+        if (produceRequest.acks == 0) 0   // ack=0表示发到broker就返回，不关心副本是否写入
         else quotas.request.maybeRecordAndGetThrottleTimeMs(request, timeMs)
       val maxThrottleTimeMs = Math.max(bandwidthThrottleTimeMs, requestThrottleTimeMs)
       if (maxThrottleTimeMs > 0) {
@@ -640,8 +651,19 @@ class KafkaApis(val requestChannel: RequestChannel,
         }
       }
 
+      /**
+       * 这里补充一下关于Response的几个方法：
+        1、sendResponse（RequestChannel.Response）：最底层的 Response 发送方法。本质上，它调用了 SocketServer 组件中 RequestChannel 的 sendResponse 方法，会把待发送的 Response 对象添加到对应 Processor 线程的 Response 队列上，然后交由 Processor 线程完成网络间的数据传输。
+        2、sendResponse（RequestChannel.Request，responseOpt:
+Option[AbstractResponse]，onComplete: Option[Send => Unit]）：该方法接收的实际上是 Request，而非 Response，因此，它会在内部构造出 Response 对象之后，再调用 sendResponse 方法。
+        3、sendNoOpResponseExemptThrottle：发送 NoOpResponse 类型的 Response 而不受请求通道上限流（throttling）的限制。所谓的 NoOpResponse，是指 Processor 线程取出该类型的 Response 后，不执行真正的 I/O 发送操作。
+        4、sendErrorResponseExemptThrottle：发送携带错误信息的 Response 而不受限流限制。
+        5、sendResponseExemptThrottle：发送普通 Response 而不受限流限制。
+        6、sendErrorResponseMaybeThrottle：发送携带错误信息的 Response 但接受限流的约束。
+        7、sendResponseMaybeThrottle：发送普通 Response 但接受限流的约束。
+       */
       // Send the response immediately. In case of throttling, the channel has already been muted.
-      if (produceRequest.acks == 0) {
+      if (produceRequest.acks == 0) { // ack=0表示发到broker就返回，不关心副本是否写入
         // no operation needed if producer request.required.acks = 0; however, if there is any error in handling
         // the request, since no response is expected by the producer, the server will close socket server so that
         // the producer client will know that some error has happened and will refresh its metadata
@@ -660,7 +682,7 @@ class KafkaApis(val requestChannel: RequestChannel,
           // bandwidth quota violation.
           requestHelper.sendNoOpResponseExemptThrottle(request)
         }
-      } else {
+      } else { // ack为-1或1的响应
         requestChannel.sendResponse(request, new ProduceResponse(mergedResponseStatus.asJava, maxThrottleTimeMs), None)
       }
     }
@@ -670,10 +692,12 @@ class KafkaApis(val requestChannel: RequestChannel,
         updateRecordConversionStats(request, tp, info)
       }
     }
-
-    if (authorizedRequestInfo.isEmpty)
+    //如果已经授权的请求集合为空，说明请求没有权限，则执行回调函数
+    if (authorizedRequestInfo.isEmpty) {
+      //sendResponseCallback() 方法作为请求处理完成的回调传入
       sendResponseCallback(Map.empty)
-    else {
+    } else {//否则，说明请求已经授权，可以往服务端写数据
+      // 只有__admin_client客户端才能写入内部topic，例如__consumer_offset
       val internalTopicsAllowed = request.header.clientId == AdminUtils.ADMIN_CLIENT_ID
 
       val transactionStatePartition =
@@ -683,20 +707,30 @@ class KafkaApis(val requestChannel: RequestChannel,
           Some(txnCoordinator.partitionFor(produceRequest.transactionalId()))
 
       // call the replica manager to append messages to the replicas
+      //将record添加到副本broker
+      // 开始调用副本管理器追加消息
       replicaManager.appendRecords(
+        // 超时时间, 客户端Sender中的requestTimeoutMs，表示客户端请求超时
         timeout = produceRequest.timeout.toLong,
+        // ack参数
         requiredAcks = produceRequest.acks,
+        // 是否允许添加内部topic消息
         internalTopicsAllowed = internalTopicsAllowed,
+        // 请求来自client，也有可能来自别的broker
         origin = AppendOrigin.CLIENT,
+        // 消息体
         entriesPerPartition = authorizedRequestInfo,
         requestLocal = requestLocal,
+        //响应函数
         responseCallback = sendResponseCallback,
+        //状态转换函数
         recordConversionStatsCallback = processingStatsCallback,
         transactionalId = produceRequest.transactionalId(),
         transactionStatePartition = transactionStatePartition)
 
       // if the request is put into the purgatory, it will have a held reference and hence cannot be garbage collected;
       // hence we clear its data here in order to let GC reclaim its memory since it is already appended to log
+      // 如果需要被放入purgatory，清空引用让GC回收, 因为已经append到log了
       produceRequest.clearPartitionRecords()
     }
   }

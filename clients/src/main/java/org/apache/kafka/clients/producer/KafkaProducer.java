@@ -504,6 +504,7 @@ public class KafkaProducer<K, V> implements Producer<K, V> {
                         logContext,
                         clusterResourceListeners,
                         Time.SYSTEM);
+                //metadata初始化，主要把address初始化到MetadataCache中
                 this.metadata.bootstrap(addresses);
             }
             this.errors = this.metrics.sensor("errors");
@@ -1066,7 +1067,10 @@ public class KafkaProducer<K, V> implements Producer<K, V> {
             long nowMs = time.milliseconds();
             ClusterAndWaitTime clusterAndWaitTime;
             try {
-                // 获取topic-partition的元数据
+                /**
+                 * 获取 topic 的分区列表，如果本地没有该topic的分区信息，则需要向远端 broker 获取，
+                 *  该方法会返回拉取元数据所耗费的时间。在消息发送时的最大等待时间时会扣除该部分损耗的时间。
+                 */
                 clusterAndWaitTime = waitOnMetadata(record.topic(), record.partition(), nowMs, maxBlockTimeMs);
             } catch (KafkaException e) {
                 if (metadata.isClosed())
@@ -1106,7 +1110,7 @@ public class KafkaProducer<K, V> implements Producer<K, V> {
             setReadOnly(record.headers());
             Header[] headers = record.headers().toArray();
 
-            // 根据使用的版本号，按照消息协议来计算消息的长度，并是否超过指定长度，如果超过则抛出异常。
+            // 根据使用的版本号，按照消息协议来计算消息的长度，并是否超过指定长度，如果超过则抛出异常
             int serializedSize = AbstractRecords.estimateSizeInBytesUpperBound(apiVersions.maxUsableProduceMagic(),
                     compressionType, serializedKey, serializedValue, headers);
             /**
@@ -1124,7 +1128,8 @@ public class KafkaProducer<K, V> implements Producer<K, V> {
             // Append the record to the accumulator.  Note, that the actual partition may be
             // calculated there and can be accessed via appendCallbacks.topicPartition.
             /**
-             * 内存，默认 32m，里面是默认 16k 一个批次
+             * 缓存区内存，默认 32m，里面是默认 16k 一个批次
+             * Kafka.send() 方法执行完成后，此时消息还不一定成功发送到 broker，KafkaProducer.send()方法只需要把消息放入到RecordAccumulator缓存区即可
              */
             RecordAccumulator.RecordAppendResult result = accumulator.append(record.topic(), partition, timestamp, serializedKey,
                     serializedValue, headers, appendCallbacks, remainingWaitMs, abortOnNewBatch, nowMs, cluster);
@@ -1253,6 +1258,7 @@ public class KafkaProducer<K, V> implements Producer<K, V> {
             // 获取更新最新的cluster信息
             cluster = metadata.fetch();
             elapsed = time.milliseconds() - nowMs;
+            // 等待超过最大超时时间，直接抛出异常
             if (elapsed >= maxWaitMs) {
                 throw new TimeoutException(partitionsCount == null ?
                         String.format("Topic %s not present in metadata after %d ms.",
@@ -1262,7 +1268,8 @@ public class KafkaProducer<K, V> implements Producer<K, V> {
             }
             metadata.maybeThrowExceptionForTopic(topic);
             remainingWaitMs = maxWaitMs - elapsed;
-            // 获取当前topic下的分区数量
+            //尝试获取一下，我们要发送消息的这个topic对应分区的信息。
+            //如果这个值不为null，说明前面sender线程已经获取到了元数据了。
             partitionsCount = cluster.partitionCountForTopic(topic);
         } while (partitionsCount == null || (partition != null && partition >= partitionsCount));// 不停循环,直到 partitionsCount 不为 null（即直到 metadata 中已经包含了这个 topic 的相关信息）
 

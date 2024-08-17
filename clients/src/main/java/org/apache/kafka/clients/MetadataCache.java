@@ -51,7 +51,7 @@ public class MetadataCache {
     private final Node controller;
     private final Map<TopicPartition, PartitionMetadata> metadataByPartition;
     private final Map<String, Uuid> topicIds;
-
+    //关于 topic 的详细信息（leader 所在节点、replica 所在节点、isr 列表）都是在 Cluster 实例中保存的
     private Cluster clusterInstance;
 
     MetadataCache(String clusterId,

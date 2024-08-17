@@ -159,6 +159,10 @@ class LogManager(logDirs: Seq[File],
    * <li> Check that each path is a readable directory
    * </ol>
    */
+  //note: 创建指定的数据目录,并做相应的检查:
+  //note: 1.确保数据目录中没有重复的数据目录;
+  //note: 2.数据不存在的话就创建相应的目录;
+  //note: 3.检查每个目录路径是否是可读的。
   private def createAndValidateLogDirs(dirs: Seq[File], initialOfflineDirs: Seq[File]): ConcurrentLinkedQueue[File] = {
     val liveLogDirs = new ConcurrentLinkedQueue[File]()
     val canonicalPaths = mutable.HashSet.empty[String]
@@ -356,6 +360,8 @@ class LogManager(logDirs: Seq[File],
   /**
    * Recover and load all logs in the given data directories
    */
+  //note: 加载所有的日志,而每个日志也会调用 loadSegments() 方法加载所有的分段,过程比较慢,所有每个日志都会创建一个单独的线程
+  //note: 日志管理器采用线程池提交任务,标识不用的任务可以同时运行
   private[log] def loadLogs(defaultConfig: LogConfig, topicConfigOverrides: Map[String, LogConfig]): Unit = {
     info(s"Loading logs from log dirs $liveLogDirs")
     val startMs = time.hiResClockMs()
@@ -374,13 +380,13 @@ class LogManager(logDirs: Seq[File],
     }
 
     val uncleanLogDirs = mutable.Buffer.empty[String]
-    for (dir <- liveLogDirs) {
+    for (dir <- liveLogDirs) {//note: 处理每一个日志目录
       val logDirAbsolutePath = dir.getAbsolutePath
       var hadCleanShutdown: Boolean = false
       try {
         val pool = Executors.newFixedThreadPool(numRecoveryThreadsPerDataDir,
-          new LogRecoveryThreadFactory(logDirAbsolutePath))
-        threadPools.append(pool)
+          new LogRecoveryThreadFactory(logDirAbsolutePath))//note: 默认为 1
+        threadPools.append(pool)//note: 每个对应的数据目录都有一个线程池
 
         val cleanShutdownFile = new File(dir, LogLoader.CleanShutdownFile)
         if (cleanShutdownFile.exists) {
@@ -431,7 +437,7 @@ class LogManager(logDirs: Seq[File],
         }
 
         val jobsForDir = logsToLoad.map { logDir =>
-          val runnable: Runnable = () => {
+          val runnable: Runnable = () => {//note: 每个分区的目录都对应了一个线程
             debug(s"Loading log $logDir")
             var log = None: Option[UnifiedLog]
             val logLoadStartMs = time.hiResClockMs()
@@ -1458,6 +1464,7 @@ object LogManager {
     }) == 0
   }
 
+  //note: 检查点表示日志已经刷新到磁盘的位置，主要是用于数据恢复
   val RecoveryPointCheckpointFile = "recovery-point-offset-checkpoint"
   val LogStartOffsetCheckpointFile = "log-start-offset-checkpoint"
 
